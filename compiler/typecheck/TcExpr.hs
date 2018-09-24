@@ -1439,7 +1439,8 @@ tcSyntaxOp :: CtOrigin
            -> ([TcSigmaType] -> TcM a) -- ^ Type check any arguments
            -> TcM (a, SyntaxExpr GhcTcId)
 -- ^ Typecheck a syntax operator
--- The operator is always a variable at this stage (i.e. renamer output)
+-- The operator is a variable or a lambda at this stage (i.e. renamer
+-- output)
 tcSyntaxOp orig expr arg_tys res_ty
   = tcSyntaxOpGen orig expr arg_tys (SynType res_ty)
 
@@ -1458,6 +1459,18 @@ tcSyntaxOpGen orig (SyntaxExpr { syn_expr = HsVar _ (L _ op) })
            <- tcSynArgA orig sigma arg_tys res_ty $
               thing_inside
        ; return (result, SyntaxExpr { syn_expr      = mkHsWrap expr_wrap expr
+                                    , syn_arg_wraps = arg_wraps
+                                    , syn_res_wrap  = res_wrap }) }
+
+-- See note "Monad fail : Rebindable syntax, overloaded strings" in
+-- RnExpr.hs
+tcSyntaxOpGen  orig (op@(SyntaxExpr { syn_expr = HsLam _ _ }))
+               arg_tys res_ty thing_inside
+  = do { (expr, sigma) <- tcInferSigma $ noLoc $ (syn_expr op)
+       ; (result, expr_wrap, arg_wraps, res_wrap)
+           <- tcSynArgA orig sigma arg_tys res_ty $
+              thing_inside
+       ; return (result, SyntaxExpr { syn_expr      = mkHsWrap expr_wrap $ unLoc expr
                                     , syn_arg_wraps = arg_wraps
                                     , syn_res_wrap  = res_wrap }) }
 
