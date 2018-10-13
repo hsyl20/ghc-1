@@ -602,6 +602,9 @@
       SymI_HasProto(getOrSetLibHSghcGlobalDynFlags)                     \
       SymI_HasProto(genericRaise)                                       \
       SymI_HasProto(getProgArgv)                                        \
+      SymI_HasProto(setProgArgv)                                        \
+      SymI_HasProto(getResponseFilesArgv)                               \
+      SymI_HasProto(setResponseFilesArgv)                               \
       SymI_HasProto(getFullProgArgv)                                    \
       SymI_HasProto(setFullProgArgv)                                    \
       SymI_HasProto(freeFullProgArgv)                                   \
@@ -749,7 +752,6 @@
       SymI_HasProto(rts_enableThreadAllocationLimit)                    \
       SymI_HasProto(rts_disableThreadAllocationLimit)                   \
       SymI_HasProto(rts_setMainThread)                                  \
-      SymI_HasProto(setProgArgv)                                        \
       SymI_HasProto(startupHaskell)                                     \
       SymI_HasProto(shutdownHaskell)                                    \
       SymI_HasProto(shutdownHaskellAndExit)                             \

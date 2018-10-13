@@ -1024,6 +1024,13 @@ for example).
     distributing binaries to build with either ``-rtsopts`` or
     ``-no-rtsopts-suggestions``.
 
+.. ghc-flag:: -no-expand-response-files
+    :shortdesc: Do not expand response file arguments at runtime.
+    :type: dynamic
+    :category: linking
+
+    This option instructs the RTS to not expand response file arguments at runtime.
+
 .. ghc-flag:: -fno-gen-manifest
     :shortdesc: Do not generate a manifest file (Windows only)
     :type: dynamic

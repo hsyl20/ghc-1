@@ -24,8 +24,13 @@ module GHC.ResponseFile (
   ) where
 
 import Control.Exception
+import Control.Monad      (liftM)
 import Data.Char          (isSpace)
 import Data.Foldable      (foldl')
+import Foreign
+import Foreign.C
+import qualified GHC.Foreign as GHC
+import GHC.IO.Encoding    (argvEncoding)
 import System.Environment (getArgs)
 import System.Exit        (exitFailure)
 import System.IO
@@ -59,7 +64,17 @@ Then the result of invoking @foo@ with @args.txt@ is:
 
 -}
 getArgsWithResponseFiles :: IO [String]
-getArgsWithResponseFiles = getArgs >>= expandResponse
+getArgsWithResponseFiles =
+  alloca $ \ p_argc ->
+  alloca $ \ p_argv -> do
+    getResponseFilesArgv p_argc p_argv
+    p    <- fromIntegral `liftM` peek p_argc
+    argv <- peek p_argv
+    enc  <- argvEncoding
+    peekArray (p - 1) (advancePtr argv 1) >>= mapM (GHC.peekCString enc)
+
+foreign import ccall unsafe "getResponseFilesArgv"
+  getResponseFilesArgv :: Ptr CInt -> Ptr (Ptr CString) -> IO ()
 
 -- | Given a string of concatenated strings, separate each by removing
 -- a layer of /quoting/ and\/or /escaping/ of certain characters.

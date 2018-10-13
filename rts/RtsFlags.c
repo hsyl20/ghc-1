@@ -16,6 +16,8 @@
 #include "sm/OSMem.h"
 #include "hooks/Hooks.h"
 #include "Capability.h"
+#include "fs_rts.h"
+#include "ResponseFile.h"
 
 #if defined(HAVE_CTYPE_H)
 #include <ctype.h>
@@ -31,8 +33,6 @@
 #include <sys/types.h>
 #endif
 
-#include <fs_rts.h>
-
 // Flag Structure
 RTS_FLAGS RtsFlags;
 
@@ -47,6 +47,18 @@ char   *prog_name = NULL; /* 'basename' of prog_argv[0] */
 int     rts_argc = 0;  /* ditto */
 char  **rts_argv = NULL;
 int     rts_argv_size = 0;
+// A separate argument vector which contains arguments expanded from response
+// files, in addition to the arguments stored in prog_argv. For example:
+//
+//     ./foo a1 a2 @file1 a3
+//
+//     prog_argv = ["a1", "a2", "@file1", "a3"]
+//     rf_argv   = ["a1", "a2", "b1", "b2", "b3", "a3"]
+//
+// 'setupRtsFlags' ensures that these argument vectors have proper values.
+// See Trac #15732 and Note [Processing response files] in 'ResponseFile.c'.
+char  **rf_argv = NULL;
+int     rf_argc = 0;
 #if defined(mingw32_HOST_OS)
 // On Windows hs_main uses GetCommandLineW to get Unicode arguments and
 // passes them along UTF8 encoded as argv. We store them here in order to
@@ -63,6 +75,7 @@ const RtsConfig defaultRtsConfig  = {
     .rts_opts_enabled = RtsOptsSafeOnly,
     .rts_opts_suggestions = true,
     .rts_opts = NULL,
+    .expand_response_files = true,
     .rts_hs_main = false,
     .keep_cafs = false,
     .eventlog_writer = &FileEventLogWriter,
@@ -89,6 +102,10 @@ const RtsConfig defaultRtsConfig  = {
 static void procRtsOpts (int rts_argc0, RtsOptsEnabledEnum enabled);
 
 static void normaliseRtsOpts (void);
+
+static void moveRtsOpts(uint32_t total_arg, int *argc, char ***argv,
+                        uint32_t *rf_iteration_limit, bool rf_mode,
+                        bool append_rts_arg, bool expand);
 
 static void initStatsFile (FILE *f);
 
@@ -543,6 +560,10 @@ STATIC_INLINE bool strequal(const char *a, const char * b)
     return(strcmp(a, b) == 0);
 }
 
+STATIC_INLINE bool isResponseFileArg(const char *arg) {
+    return (arg[0] == '@');
+}
+
 // We can't predict up front how much space we'll need for rts_argv,
 // because it involves parsing ghc_rts_opts and GHCRTS, so we
 // expand it on demand.
@@ -589,6 +610,77 @@ static void errorRtsOptsDisabled(const char *s)
     errorBelch(s, advice);
 }
 
+// Split arguments (argv) into PGM (argv) and RTS (rts_argv) parts
+static void moveRtsOpts(uint32_t total_arg, int *argc, char ***argv,
+                        uint32_t *rf_iteration_limit, bool rf_mode,
+                        bool append_rts_arg, bool expand)
+{
+    uint32_t mode = PGM,
+             arg  = 1; // argv[0] must be PGM argument -- leave in argv
+
+    for (; arg < total_arg; arg++) {
+        // The '--RTS' argument disables all future
+        // +RTS ... -RTS processing.
+        if (strequal("--RTS", (*argv)[arg])) {
+            arg++;
+            break;
+        }
+        // The '--' argument is passed through to the program, but
+        // disables all further +RTS ... -RTS processing.
+        else if (strequal("--", (*argv)[arg])) {
+            break;
+        }
+        else if (strequal("+RTS", (*argv)[arg])) {
+            mode = RTS;
+        }
+        else if (strequal("-RTS", (*argv)[arg])) {
+            mode = PGM;
+        }
+        // Ordering is important here. This branch is before the next one
+        // because it allows expanding '@file' arguments that occur in between
+        // +RTS ... -RTS.
+        else if (isResponseFileArg((*argv)[arg])) {
+            // If we are processing regular 'argv', we do not want to
+            // expand response files. Copy the argument as is.
+            if (!rf_mode) {
+                (*argv)[(*argc)++] = (*argv)[arg];
+            } else {
+                // If we have iterated too many times then stop.
+                if (--(*rf_iteration_limit) == 0) {
+                    errorBelch("Too many @-files encountered in %s\n",
+                               (*argv)[arg]);
+                    stg_exit(EXIT_FAILURE);
+                }
+                expandargv(&total_arg, argv, &arg);
+            }
+        }
+        else if (mode == RTS) {
+            // See Note [Avoiding duplicates in rts_argv]
+            if (append_rts_arg) {
+                appendRtsArg(copyArg((*argv)[arg]));
+            }
+        }
+        else {
+            (*argv)[(*argc)++] = (*argv)[arg];
+        }
+    }
+
+    // process remaining arguments
+    for (; arg < total_arg; arg++) {
+        if (isResponseFileArg((*argv)[arg]) && rf_mode && expand) {
+            if (--(*rf_iteration_limit) == 0) {
+                errorBelch("Too many @-files encountered in %s\n",
+                           (*argv)[arg]);
+                stg_exit(EXIT_FAILURE);
+            }
+            expandargv(&total_arg, argv, &arg);
+        }
+        else {
+            (*argv)[(*argc)++] = (*argv)[arg];
+        }
+    }
+}
+
 /* -----------------------------------------------------------------------------
    Parse the command line arguments, collecting options for the RTS.
 
@@ -602,6 +694,11 @@ static void errorRtsOptsDisabled(const char *s)
      - prog_argv[] (global) contains a copy of the non-RTS args (== argv)
      - prog_argc   (global) contains the count of args in prog_argv
 
+     - rf_argv[]   (global) contains arguments from argv, but the response
+                            file arguments are replaced with the arguments
+                            in that file.
+       rf_argc     (global) contains the count of args in rf_argv
+
      - prog_name   (global) contains the basename of prog_argv[0]
 
      - rtsConfig   (global) contains the supplied RtsConfig
@@ -609,38 +706,45 @@ static void errorRtsOptsDisabled(const char *s)
   On Windows argv is assumed to be utf8 encoded for unicode compatibility.
   See Note [Windows Unicode Arguments]
 
+  'setupRtsFlags' is also responsible for parsing arguments passed via
+  response files. See Trac #15732 and Note [Processing response files]
+  in 'ResponseFile.c'.
+
   -------------------------------------------------------------------------- */
 
 void setupRtsFlags (int *argc, char *argv[], RtsConfig rts_config)
 {
-    uint32_t mode;
-    uint32_t total_arg;
-    uint32_t arg, rts_argc0;
+    uint32_t total_arg, rf_total_arg;
+    uint32_t rts_argc0;
+
+    // Limit the number of response files that we parse in order
+    // to prevent infinite recursion.
+    uint32_t rf_iteration_limit = 2000;
 
     rtsConfig = rts_config;
 
     setProgName (argv);
     total_arg = *argc;
-    arg = 1;
-
     if (*argc > 1) { *argc = 1; };
-    rts_argc = 0;
 
+    rts_argc = 0;
     rts_argv_size = total_arg + 1;
     rts_argv = stgMallocBytes(rts_argv_size * sizeof (char *), "setupRtsFlags");
-
     rts_argc0 = rts_argc;
+
+    // Start with rf_argv == argv.
+    rf_argv = copyArgv(total_arg, argv);
+    rf_argc = 1;
+    rf_total_arg = total_arg;
 
     // process arguments from the -with-rtsopts compile-time flag first
     // (arguments from the GHCRTS environment variable and the command
     // line override these).
-    {
-        if (rtsConfig.rts_opts != NULL) {
-            splitRtsFlags(rtsConfig.rts_opts);
-            // opts from rts_opts are always enabled:
-            procRtsOpts(rts_argc0, RtsOptsAll);
-            rts_argc0 = rts_argc;
-        }
+    if (rtsConfig.rts_opts != NULL) {
+        splitRtsFlags(rtsConfig.rts_opts);
+        // opts from rts_opts are always enabled:
+        procRtsOpts(rts_argc0, RtsOptsAll);
+        rts_argc0 = rts_argc;
     }
 
     // process arguments from the GHCRTS environment variable next
@@ -663,49 +767,58 @@ void setupRtsFlags (int *argc, char *argv[], RtsConfig rts_config)
         }
     }
 
-
-    // If we ignore all commandline rtsOpts we skip processing of argv by
-    // the RTS completely
+    // If we ignore all command line rtsOpts we skip processing of argv
+    // by 'moveRtsOpts'.
     if(!(rtsConfig.rts_opts_enabled == RtsOptsIgnoreAll ||
-         rtsConfig.rts_opts_enabled == RtsOptsIgnore)
-    )
-    {
-        // Split arguments (argv) into PGM (argv) and RTS (rts_argv) parts
-        //   argv[0] must be PGM argument -- leave in argv
-        //
-        for (mode = PGM; arg < total_arg; arg++) {
-            // The '--RTS' argument disables all future
-            // +RTS ... -RTS processing.
-            if (strequal("--RTS", argv[arg])) {
-                arg++;
-                break;
-            }
-            // The '--' argument is passed through to the program, but
-            // disables all further +RTS ... -RTS processing.
-            else if (strequal("--", argv[arg])) {
-                break;
-            }
-            else if (strequal("+RTS", argv[arg])) {
-                mode = RTS;
-            }
-            else if (strequal("-RTS", argv[arg])) {
-                mode = PGM;
-            }
-            else if (mode == RTS) {
-                appendRtsArg(copyArg(argv[arg]));
-            }
-            else {
-                argv[(*argc)++] = argv[arg];
+         rtsConfig.rts_opts_enabled == RtsOptsIgnore)) {
+        /**
+         * Note [Avoiding duplicates in rts_argv]
+         * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+         * If we're going to expand response files, rf_argv would have all
+         * RTS options from prog_argv, and maybe more. So it's safe to
+         * only collect RTS options from this array. In fact, if we also
+         * collect RTS options from prog_argv, we would end up duplicating
+         * some options in rts_argv. We only collect RTS options from
+         * prog_argv if response files are not being expanded.
+         */
+        if (rtsConfig.expand_response_files) {
+            moveRtsOpts(rf_total_arg, &rf_argc, &rf_argv, &rf_iteration_limit,
+                        true, true, true);
+            moveRtsOpts(total_arg, argc, &argv, &rf_iteration_limit,
+                        false, false, true);
+        } else {
+            // We're not expanding response files, so rf_argv == prog_argv.
+            // And we must collect RTS options from prog_argv.
+            moveRtsOpts(total_arg, argc, &argv, &rf_iteration_limit,
+                        false, true, false);
+            rf_argv = copyArgv(total_arg, argv);
+            rf_argc = *argc;
+        }
+    } else {
+        uint32_t arg = 1;
+
+        // Even if we ignore RTS options, we may still have to
+        // expand response files.
+        if (rtsConfig.expand_response_files) {
+            for (; arg < rf_total_arg; arg++) {
+                // It's not a response file argument, just copy it.
+                if (!isResponseFileArg(rf_argv[arg])) {
+                    rf_argv[rf_argc++] = rf_argv[arg];
+                } else {
+                    if (--rf_iteration_limit == 0) {
+                        errorBelch("Too many @-files encountered in %s\n",
+                                   rf_argv[arg]);
+                        stg_exit(EXIT_FAILURE);
+                    }
+                    expandargv(&rf_total_arg, &rf_argv, &arg);
+                }
             }
         }
 
+        // Since we're ignoring RTS options, we do not have to process 'argv',
+        // but must reset argc to it's original value (as argv hasn't changed).
+        *argc = total_arg;
     }
-
-    // process remaining program arguments
-    for (; arg < total_arg; arg++) {
-        argv[(*argc)++] = argv[arg];
-    }
-    argv[*argc] = (char *) 0;
 
     procRtsOpts(rts_argc0, rtsConfig.rts_opts_enabled);
 
@@ -2165,6 +2278,31 @@ freeProgArgv(void)
     prog_argc = 0;
     prog_argv = NULL;
 }
+
+void
+getResponseFilesArgv(int *argc, char **argv[])
+{
+    if (argc) { *argc = rf_argc; }
+    if (argv) { *argv = rf_argv; }
+}
+
+void
+setResponseFilesArgv(int argc, char *argv[])
+{
+    freeArgv(rf_argc,rf_argv);
+    rf_argc = argc;
+    rf_argv = copyArgv(argc,argv);
+    setProgName(rf_argv);
+}
+
+/* static void */
+/* freeResponseFilesArgv(void) */
+/* { */
+/*     freeArgv(rf_argc,rf_argv); */
+/*     rf_argc = 0; */
+/*     rf_argv = NULL; */
+/* } */
+
 
 /* ----------------------------------------------------------------------------
    The full argv - a copy of the original program's argc/argv
