@@ -111,7 +111,6 @@ import PrelNames
 import Util
 import Outputable
 import FastString
-import SrcLoc
 import Bag
 import Pair
 import UniqSet
@@ -504,49 +503,63 @@ tcSuperSkolTyVar subst tv
 
 -- | Given a list of @['TyVar']@, skolemize the type variables,
 -- returning a substitution mapping the original tyvars to the
--- skolems, and the list of newly bound skolems.  See also
--- tcInstSkolTyVars' for a precondition.  The resulting
--- skolems are non-overlappable; see Note [Overlap and deriving]
--- for an example where this matters.
+-- skolems, and the list of newly bound skolems.
 tcInstSkolTyVars :: [TyVar] -> TcM (TCvSubst, [TcTyVar])
+-- See Note [Skolemising type variables]
 tcInstSkolTyVars = tcInstSkolTyVarsX emptyTCvSubst
 
 tcInstSkolTyVarsX :: TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+-- See Note [Skolemising type variables]
 tcInstSkolTyVarsX = tcInstSkolTyVars' False
 
 tcInstSuperSkolTyVars :: [TyVar] -> TcM (TCvSubst, [TcTyVar])
+-- See Note [Skolemising type variables]
 tcInstSuperSkolTyVars = tcInstSuperSkolTyVarsX emptyTCvSubst
 
 tcInstSuperSkolTyVarsX :: TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+-- See Note [Skolemising type variables]
 tcInstSuperSkolTyVarsX subst = tcInstSkolTyVars' True subst
 
 tcInstSkolTyVars' :: Bool -> TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
--- Precondition: tyvars should be ordered (kind vars first)
--- see Note [Kind substitution when instantiating]
--- Get the location from the monad; this is a complete freshening operation
+-- See Note [Skolemising type variables]
 tcInstSkolTyVars' overlappable subst tvs
-  = do { loc <- getSrcSpanM
-       ; lvl <- getTcLevel
-       ; instSkolTyCoVarsX (mkTcSkolTyVar lvl loc overlappable) subst tvs }
+  = do { loc    <- getSrcSpanM
+       ; tc_lvl <- getTcLevel
+       ; let pushed_lvl = pushTcLevel tc_lvl
+             -- pushTcLevel: see Note [Skolemising type variables] (a)
 
-mkTcSkolTyVar :: TcLevel -> SrcSpan -> Bool -> TcTyCoVarMaker gbl lcl
--- Allocates skolems whose level is ONE GREATER THAN the passed-in tc_lvl
--- See Note [Skolem level allocation]
-mkTcSkolTyVar tc_lvl loc overlappable old_name kind
-  = do { uniq <- newUnique
-       ; let name = mkInternalName uniq (getOccName old_name) loc
-       ; return (mkTcTyVar name kind details) }
-  where
-    details = SkolemTv (pushTcLevel tc_lvl) overlappable
-              -- pushTcLevel: see Note [Skolem level allocation]
+             details = SkolemTv pushed_lvl overlappable
 
-{- Note [Skolem level allocation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We generally allocate skolems /before/ calling pushLevelAndCaptureConstraints.
-So we want their level to the level of the soon-to-be-created implication,
-which has a level one higher than the current level.  Hence the pushTcLevel.
-It feels like a slight hack.  Applies also to vanillaSkolemTv.
+             new_skol_tv :: TcTyCoVarMaker TcGblEnv TcLclEnv
+             new_skol_tv old_name kind
+               = do { uniq <- newUnique
+                     ; let name = mkInternalName uniq (getOccName old_name) loc
+                     ; return (mkTcTyVar name kind details) }
 
+       ; instSkolTyCoVarsX new_skol_tv subst tvs }
+
+{- Note [Skolemising type variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The tcInstSkolTyVars family of functions instantiate a list of TyVars
+to fresh skolem TcTyVars. Important notes:
+
+a) Level allocation. We generally skolemise /before/ calling
+   pushLevelAndCaptureConstraints.  So we want their level to the level
+   of the soon-to-be-created implication, which has a level ONE HIGHER
+   than the current level.  Hence the pushTcLevel.  It feels like a
+   slight hack.
+
+b) The [TyVar] should be ordered (kind vars first)
+   See Note [Kind substitution when instantiating]
+
+c) It's a complete freshening operation: the skolems have a fresh
+   unique, and a location from the monad
+
+d) The resulting skolems are
+        non-overlappable for tcInstSkolTyVars,
+   but overlappable for tcInstSuperSkolTyVars
+   See TcDerivInfer Note [Overlap and deriving] for an example
+   of where this matters.
 -}
 
 ------------------
@@ -1016,15 +1029,17 @@ quantifyTyVars
 
 quantifyTyVars gbl_tvs dvs@(DV{ dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
   = do { traceTc "quantifyTyVars" (vcat [ppr dvs, ppr gbl_tvs])
-       ; let dep_kvs = dVarSetElemsWellScoped $
-                       dep_tkvs `dVarSetMinusVarSet` gbl_tvs
+       ; let covars     = filterVarSet isCoVar (dVarSetToVarSet dep_tkvs)
+             mono_tvs   = gbl_tvs `unionVarSet` closeOverKinds covars
+             dep_kv_set = dep_tkvs `dVarSetMinusVarSet` mono_tvs
+             dep_kvs    = dVarSetElemsWellScoped dep_kv_set
                        -- dVarSetElemsWellScoped: put the kind variables into
                        --    well-scoped order.
                        --    E.g.  [k, (a::k)] not the other way roud
 
              nondep_tvs = dVarSetElems $
                           (nondep_tkvs `minusDVarSet` dep_tkvs)
-                           `dVarSetMinusVarSet` gbl_tvs
+                           `dVarSetMinusVarSet` mono_tvs
                  -- See Note [Dependent type variables] in TcType
                  -- The `minus` dep_tkvs removes any kind-level vars
                  --    e.g. T k (a::k)   Since k appear in a kind it'll
@@ -1035,6 +1050,23 @@ quantifyTyVars gbl_tvs dvs@(DV{ dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
                  -- No worry about scoping, because these are all
                  --    type variables
                  -- NB kinds of tvs are zonked by zonkTyCoVarsAndFV
+
+       -- This block uses level numbers to decide what to quantify
+       -- and emits a warning if the two methods do not give the same answer
+       ; outer_tclvl <- getTcLevel
+       ; let dep_kvs2    = dVarSetElemsWellScoped $
+                           filterDVarSet (quantifiableTv outer_tclvl) dep_tkvs
+             nondep_tvs2 = filter (quantifiableTv outer_tclvl) $
+                           dVarSetElems (nondep_tkvs `minusDVarSet` dep_tkvs)
+
+             all_ok = dep_kvs == dep_kvs2 && nondep_tvs == nondep_tvs2
+             bad_msg = hang (text "Quantificaiton by level numbers would fail")
+                          2 (vcat [ text "Outer level =" <+> ppr outer_tclvl
+                                  , text "dep_kvs ="     <+> ppr dep_kvs
+                                  , text "dep_kvs2 ="    <+> ppr dep_kvs2
+                                  , text "nondep_tvs ="  <+> ppr nondep_tvs
+                                  , text "nondep_tvs2 =" <+> ppr nondep_tvs2 ])
+       ; WARN( not all_ok, bad_msg ) return ()
 
              -- In the non-PolyKinds case, default the kind variables
              -- to *, and zonk the tyvars as usual.  Notice that this
@@ -1079,6 +1111,15 @@ quantifyTyVars gbl_tvs dvs@(DV{ dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
                True  -> return Nothing
                False -> do { tv <- zonkQuantifiedTyVar tkv
                            ; return (Just tv) } }
+
+quantifiableTv :: TcLevel   -- Level of the context, outside the quantification
+               -> TcTyVar
+               -> Bool
+quantifiableTv outer_tclvl tcv
+  | isTcTyVar tcv  -- Might be a CoVar; change this when gather covars separtely
+  = tcTyVarLevel tcv > outer_tclvl
+  | otherwise
+  = False
 
 zonkQuantifiedTyVar :: TcTyVar -> TcM TcTyVar
 -- The quantified type variables often include meta type variables
