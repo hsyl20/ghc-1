@@ -891,15 +891,20 @@ sortByPreference prec_map = sortBy (flip (compareByPreference prec_map))
 --
 -- Pursuant to #12518, we could change this policy to, for example, remove
 -- the version preference, meaning that we would always prefer the packages
--- in alter package database.
+-- in later package database.
 --
+-- Instead, we only use that preference-only policy when the package names are
+-- different. This currently only happens when we're looking up which concrete
+-- package to use in place of @integer-wired-in@.
 compareByPreference
     :: PackagePrecedenceIndex
     -> PackageConfig
     -> PackageConfig
     -> Ordering
-compareByPreference prec_map pkg pkg' =
-    case comparing packageVersion pkg pkg' of
+compareByPreference prec_map pkg pkg'
+  -- same package, we compare by version then by preference
+  | packageName pkg == packageName pkg'
+  = case comparing packageVersion pkg pkg' of
         GT -> GT
         EQ | Just prec  <- Map.lookup (unitId pkg)  prec_map
            , Just prec' <- Map.lookup (unitId pkg') prec_map
@@ -909,6 +914,17 @@ compareByPreference prec_map pkg pkg' =
            | otherwise
            -> EQ
         LT -> LT
+  -- different packages, we only rely on precedence here
+  | Just prec  <- Map.lookup (unitId pkg)  prec_map
+  , Just prec' <- Map.lookup (unitId pkg') prec_map
+  = compare prec prec'
+
+  -- different packages, but no precedence information: this should not
+  -- happen, so let's error out loudly if we somehow ever encounter this
+  -- situation, instead of making a bad package choice which will silently
+  -- cause problems, like in: https://github.com/snowleopard/hadrian/issues/702
+  | otherwise
+  = panic "compareByPreference: different packages, no precedence information"
 
 comparing :: Ord a => (t -> a) -> t -> t -> Ordering
 comparing f a b = f a `compare` f b
