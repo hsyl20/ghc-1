@@ -63,7 +63,6 @@ import Data.Array
 import qualified Data.List.NonEmpty as NE
 
 import Unique           ( mkVarOccUnique )
-import TcEvidence       ( HsWrapper( WpHole ) )
 
 {-
 ************************************************************************
@@ -2130,11 +2129,25 @@ monadFailOp pat ctxt
 Note [Monad fail : Rebindable syntax, overloaded strings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The usual case is to lookup and return 'fail' here, but in the
-presence of the 'RebindableSyntax' and 'OverloadedStrings' extensions,
-'fail' has the wrong type (its argument is @[Char]@).
+Given the code
+  foo x = do { Just y <- x; return y }
 
-In this case, we synthesize the function @\x -> fail (fromString x)@.
+we expect it to desugar as
+  foo x = x >>= \r -> case r of
+                        Just y  -> return y
+                        Nothing -> fail "Pattern match error"
+
+But with RebindableSyntax and OverloadedStrings, we really want
+it to desugar thus:
+  foo x = x >>= \r -> case r of
+                        Just y  -> return y
+                        Nothing -> fail (fromString "Patterm match error")
+
+So, in this case, we synthesize the function
+  \x -> fail (fromString x)
+
+(rather than plain 'fail') for the 'fail' operation. This is done in
+'getMonadFailOp'.
 -}
 getMonadFailOp :: RnM (SyntaxExpr GhcRn, FreeVars) -- Syntax expr fail op
 getMonadFailOp
@@ -2151,31 +2164,12 @@ getMonadFailOp
             arg_name = mkSystemVarName (mkVarOccUnique arg_lit) arg_lit
             arg_syn_expr = mkRnSyntaxExpr arg_name
         let body :: LHsExpr GhcRn =
-              noLoc $ HsApp noExt
-                (noLoc $ syn_expr failExpr)
-                (noLoc $ HsPar noExt
-                  (noLoc $ HsApp noExt
-                    (noLoc $ syn_expr fromStringExpr)
-                    (noLoc $ syn_expr arg_syn_expr)))
+              nlHsApp (noLoc $ syn_expr failExpr)
+                      (nlHsApp (noLoc $ syn_expr fromStringExpr)
+                                (noLoc $ syn_expr arg_syn_expr))
         let failAfterFromStringExpr :: HsExpr GhcRn =
-              HsLam noExt (
-                MG { mg_ext = NoExt
-                   , mg_alts =
-                       noLoc [noLoc $
-                              Match { m_ext = noExt
-                                    , m_ctxt = LambdaExpr
-                                    , m_pats = [noLoc $ VarPat noExt $ noLoc arg_name]
-                                    , m_grhss =
-                                      GRHSs { grhssExt = noExt
-                                            , grhssGRHSs = [noLoc $ GRHS noExt [] body]
-                                            , grhssLocalBinds = noLoc emptyLocalBinds
-                                            }}]
-                     , mg_origin = Generated
-                     })
+              unLoc $ mkHsLam [noLoc $ VarPat noExt $ noLoc arg_name] body
         let failAfterFromStringSynExpr :: SyntaxExpr GhcRn =
-              SyntaxExpr { syn_expr = failAfterFromStringExpr
-                         , syn_arg_wraps = []
-                         , syn_res_wrap = WpHole
-                         }
+              mkSyntaxExpr failAfterFromStringExpr
         return (failAfterFromStringSynExpr, failFvs `plusFV` fromStringFvs)
       | otherwise = lookupSyntaxMonadFailOpName monadFailEnabled

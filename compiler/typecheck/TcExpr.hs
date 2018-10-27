@@ -1452,29 +1452,14 @@ tcSyntaxOpGen :: CtOrigin
               -> SyntaxOpType
               -> ([TcSigmaType] -> TcM a)
               -> TcM (a, SyntaxExpr GhcTcId)
-tcSyntaxOpGen orig (SyntaxExpr { syn_expr = HsVar _ (L _ op) })
-              arg_tys res_ty thing_inside
-  = do { (expr, sigma) <- tcInferId op
-       ; (result, expr_wrap, arg_wraps, res_wrap)
-           <- tcSynArgA orig sigma arg_tys res_ty $
-              thing_inside
-       ; return (result, SyntaxExpr { syn_expr      = mkHsWrap expr_wrap expr
-                                    , syn_arg_wraps = arg_wraps
-                                    , syn_res_wrap  = res_wrap }) }
-
--- See note "Monad fail : Rebindable syntax, overloaded strings" in
--- RnExpr.hs
-tcSyntaxOpGen  orig (op@(SyntaxExpr { syn_expr = HsLam _ _ }))
-               arg_tys res_ty thing_inside
+tcSyntaxOpGen orig op arg_tys res_ty thing_inside
   = do { (expr, sigma) <- tcInferSigma $ noLoc $ (syn_expr op)
        ; (result, expr_wrap, arg_wraps, res_wrap)
            <- tcSynArgA orig sigma arg_tys res_ty $
               thing_inside
-       ; return (result, SyntaxExpr { syn_expr      = mkHsWrap expr_wrap $ unLoc expr
+       ; return (result, SyntaxExpr { syn_expr = mkHsWrap expr_wrap $ unLoc expr
                                     , syn_arg_wraps = arg_wraps
                                     , syn_res_wrap  = res_wrap }) }
-
-tcSyntaxOpGen _ other _ _ _ = pprPanic "tcSyntaxOp" (ppr other)
 
 {-
 Note [tcSynArg]
