@@ -893,17 +893,23 @@ sortByPreference prec_map = sortBy (flip (compareByPreference prec_map))
 -- the version preference, meaning that we would always prefer the packages
 -- in later package database.
 --
--- Instead, we only use that preference-only policy when the package names are
--- different. This currently only happens when we're looking up which concrete
--- package to use in place of @integer-wired-in@.
+-- Instead, we use that preference based policy only when one of the packages
+-- is integer-gmp and the other is integer-simple.
+-- This currently only happens when we're looking up which concrete
+-- package to use in place of @integer-wired-in@ and that two different
+-- package databases supply a different integer library.
 compareByPreference
     :: PackagePrecedenceIndex
     -> PackageConfig
     -> PackageConfig
     -> Ordering
 compareByPreference prec_map pkg pkg'
-  -- same package, we compare by version then by preference
-  | packageName pkg == packageName pkg'
+  | Just prec  <- Map.lookup (unitId pkg)  prec_map
+  , Just prec' <- Map.lookup (unitId pkg') prec_map
+  , differentIntegerPkgs pkg pkg'
+  = compare prec prec'
+
+  | otherwise
   = case comparing packageVersion pkg pkg' of
         GT -> GT
         EQ | Just prec  <- Map.lookup (unitId pkg)  prec_map
@@ -914,17 +920,12 @@ compareByPreference prec_map pkg pkg'
            | otherwise
            -> EQ
         LT -> LT
-  -- different packages, we only rely on precedence here
-  | Just prec  <- Map.lookup (unitId pkg)  prec_map
-  , Just prec' <- Map.lookup (unitId pkg') prec_map
-  = compare prec prec'
 
-  -- different packages, but no precedence information: this should not
-  -- happen, so let's error out loudly if we somehow ever encounter this
-  -- situation, instead of making a bad package choice which will silently
-  -- cause problems, like in: https://github.com/snowleopard/hadrian/issues/702
-  | otherwise
-  = panic "compareByPreference: different packages, no precedence information"
+  where isIntegerPkg p = packageNameString p `elem`
+          ["integer-simple", "integer-gmp"]
+        differentIntegerPkgs p p' =
+          isIntegerPkg p && isIntegerPkg p' &&
+          (packageName p /= packageName p')
 
 comparing :: Ord a => (t -> a) -> t -> t -> Ordering
 comparing f a b = f a `compare` f b
