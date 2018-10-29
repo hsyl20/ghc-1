@@ -951,10 +951,9 @@ tcMonadFailOp orig pat fail_op res_ty
             | otherwise
               -> return ()
 
-         -- Get the fail op itself
-         ; (snd <$> (tcSyntaxOp orig fail_op
-                        [synKnownType stringTy]
-                        (mkCheckExpType res_ty) $ \_ -> return ())) }
+        -- Get the fail op itself
+        ; snd <$> (tcSyntaxOp orig fail_op [synKnownType stringTy]
+                             (mkCheckExpType res_ty) $ \_ -> return ()) }
 
 emitMonadFailConstraint :: LPat GhcTcId -> TcType -> TcRn ()
 emitMonadFailConstraint pat res_ty
