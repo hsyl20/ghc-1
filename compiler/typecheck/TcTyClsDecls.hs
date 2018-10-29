@@ -539,7 +539,7 @@ kcTyClGroup decls
         -- Step 3: generalisation
         -- Kind checking done for this group
         -- Now we have to kind generalize the flexis
-        ; poly_tcs <- mapAndReportM generalise initial_tcs
+        ; poly_tcs <- mapAndReportM generaliseTcTyCon initial_tcs
 
         ; traceTc "---- kcTyClGroup end ---- }" (ppr_tc_kinds poly_tcs)
         ; return poly_tcs }
@@ -548,52 +548,52 @@ kcTyClGroup decls
     ppr_tc_kinds tcs = vcat (map pp_tc tcs)
     pp_tc tc = ppr (tyConName tc) <+> dcolon <+> ppr (tyConKind tc)
 
-    generalise :: TcTyCon -> TcM TcTyCon
-    -- For polymorphic things this is a no-op
-    generalise tc
-      = setSrcSpan (getSrcSpan tc) $
-        addTyConCtxt tc $
-        do { let name = tyConName tc
-           ; tc_binders  <- mapM zonkTcTyVarBinder (tyConBinders tc)
-           ; tc_res_kind <- zonkTcType (tyConResKind tc)
-           ; let scoped_tvs  = tcTyConScopedTyVars tc
-                 user_tyvars = tcTyConUserTyVars tc
-                 tc_tyvars   = binderVars tc_binders
+generaliseTcTyCon :: TcTyCon -> TcM TcTyCon
+-- For polymorphic things this is a no-op
+generaliseTcTyCon tc
+  = setSrcSpan (getSrcSpan tc) $
+    addTyConCtxt tc $
+    do { let name = tyConName tc
+       ; tc_binders  <- mapM zonkTcTyVarBinder (tyConBinders tc)
+       ; tc_res_kind <- zonkTcType (tyConResKind tc)
+       ; let scoped_tvs  = tcTyConScopedTyVars tc
+             user_tyvars = tcTyConUserTyVars tc
+             tc_tyvars   = binderVars tc_binders
 
-              -- See Note [checkValidDependency]
-           ; checkValidDependency tc_binders tc_res_kind
+          -- See Note [checkValidDependency]
+       ; checkValidDependency tc_binders tc_res_kind
 
-           -- See Note [Generalisation for type constructors]
-           ; let kvs_to_gen = tyCoVarsOfTypesDSet (tc_res_kind : map tyVarKind tc_tyvars)
-                              `delDVarSetList` tc_tyvars
-                 dvs = DV { dv_kvs = kvs_to_gen, dv_tvs = emptyDVarSet }
-           ; kvs <- quantifyTyVars emptyVarSet dvs
+       -- See Note [Generalisation for type constructors]
+       ; let kvs_to_gen = tyCoVarsOfTypesDSet (tc_res_kind : map tyVarKind tc_tyvars)
+                          `delDVarSetList` tc_tyvars
+             dvs = DV { dv_kvs = kvs_to_gen, dv_tvs = emptyDVarSet }
+       ; kvs <- quantifyTyVars emptyVarSet dvs
 
-           -- See Note [Work out final tyConBinders]
-           ; scoped_tvs' <- zonkTyVarTyVarPairs scoped_tvs
-           ; let (specified_kvs, inferred_kvs) = partition is_specified kvs
-                 user_specified_tkvs = mkVarSet (map snd scoped_tvs')
-                 is_specified kv = kv `elemVarSet` user_specified_tkvs
-                 all_binders = mkNamedTyConBinders Inferred  inferred_kvs  ++
-                               mkNamedTyConBinders Specified specified_kvs ++
-                               tc_binders
+       -- See Note [Work out final tyConBinders]
+       ; scoped_tvs' <- zonkTyVarTyVarPairs scoped_tvs
+       ; let (specified_kvs, inferred_kvs) = partition is_specified kvs
+             user_specified_tkvs = mkVarSet (map snd scoped_tvs')
+             is_specified kv = kv `elemVarSet` user_specified_tkvs
+             all_binders = mkNamedTyConBinders Inferred  inferred_kvs  ++
+                           mkNamedTyConBinders Specified specified_kvs ++
+                           tc_binders
 
-           ; (env, all_binders') <- zonkTyVarBinders all_binders
-           ; tc_res_kind'        <- zonkTcTypeToTypeX env tc_res_kind
+       ; (env, all_binders') <- zonkTyVarBinders all_binders
+       ; tc_res_kind'        <- zonkTcTypeToTypeX env tc_res_kind
 
-             -- See Note [Check telescope again during generalisation]
-           ; checkValidTelescope all_binders user_tyvars
+         -- See Note [Check telescope again during generalisation]
+       ; checkValidTelescope all_binders user_tyvars
 
-                      -- Make sure tc_kind' has the final, zonked kind variables
-           ; traceTc "Generalise kind" $
-             vcat [ ppr name, ppr tc_binders, ppr (mkTyConKind tc_binders tc_res_kind)
-                  , ppr kvs, ppr all_binders, ppr tc_res_kind
-                  , ppr all_binders', ppr tc_res_kind'
-                  , ppr scoped_tvs ]
+                  -- Make sure tc_kind' has the final, zonked kind variables
+       ; traceTc "Generalise kind" $
+         vcat [ ppr name, ppr tc_binders, ppr (mkTyConKind tc_binders tc_res_kind)
+              , ppr kvs, ppr all_binders, ppr tc_res_kind
+              , ppr all_binders', ppr tc_res_kind'
+              , ppr scoped_tvs ]
 
-           ; return (mkTcTyCon name user_tyvars all_binders' tc_res_kind'
-                               scoped_tvs'
-                               (tyConFlavour tc)) }
+       ; return (mkTcTyCon name user_tyvars all_binders' tc_res_kind'
+                           scoped_tvs'
+                           (tyConFlavour tc)) }
 
 {- Note [Generalisation for type constructors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -731,10 +731,12 @@ getInitialKind decl@(ClassDecl { tcdLName = L _ name, tcdTyVars = ktvs, tcdATs =
   = do { let cusk = hsDeclHasCusk decl
        ; tycon <- kcLHsQTyVars name ClassFlavour cusk [] ktvs $
                   return constraintKind
+
+       -- See Note [Don't process associated types in kcLHsQTyVars]
        ; let parent_tv_prs = tcTyConScopedTyVars tycon
-            -- See Note [Don't process associated types in kcLHsQTyVars]
        ; inner_tcs <- tcExtendNameTyVarEnv parent_tv_prs $
                       getFamDeclInitialKinds (Just (cusk, parent_tv_prs)) ats
+
        ; return (tycon : inner_tcs) }
 
 getInitialKind decl@(DataDecl { tcdLName = L _ name
@@ -797,15 +799,22 @@ getFamDeclInitialKind mb_parent_info
                      , fdTyVars    = ktvs
                      , fdResultSig = L _ resultSig
                      , fdInfo      = info })
-  = do { tycon <- kcLHsQTyVars name flav cusk parent_tv_prs ktvs $
-           case resultSig of
+  = do { lvl <- getTcLevel
+       ; traceTc "getFamDeclInitialKind {" (ppr cusk <+> ppr lvl $$ ppr decl)
+       ; tycon <- kcLHsQTyVars name flav cusk parent_tv_prs ktvs $
+           do { lvl <- getTcLevel
+              ; traceTc "getFamDeclInitialKind 2" (ppr cusk <+> ppr lvl)
+
+              ; case resultSig of
              KindSig _ ki                          -> tcLHsKindSig ctxt ki
              TyVarSig _ (L _ (KindedTyVar _ _ ki)) -> tcLHsKindSig ctxt ki
-             _ -- open type families have * return kind by default
-               | tcFlavourIsOpen flav     -> return liftedTypeKind
-               -- closed type families have their return kind inferred
-               -- by default
-               | otherwise                -> newMetaKindVar
+             _ | tcFlavourIsOpen flav -> return liftedTypeKind
+                 -- Open type families have * return kind by default
+               | otherwise            -> newMetaKindVar }
+                 -- Closed type families have their return
+                 -- kind inferred by default
+
+       ; traceTc "getFamDeclInitialKind end }" empty
        ; return tycon }
   where
     (mb_cusk, mb_parent_tv_prs) = munzip mb_parent_info
@@ -1728,7 +1737,7 @@ kcFamTyPats :: TcTyCon
             -> TcM ()
 kcFamTyPats tc_fam_tc tv_names arg_pats kind_checker
   = discardResult $
-    kcImplicitTKBndrs tv_names $
+    kcImplicitTKBndrsSkol tv_names $
     do { let name     = tyConName tc_fam_tc
              loc      = nameSrcSpan name
              lhs_fun  = L loc (HsTyVar noExt NotPromoted (L loc name))
